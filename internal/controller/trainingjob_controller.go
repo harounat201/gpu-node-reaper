@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -13,6 +15,16 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	trainingv1alpha1 "github.com/harounat201/gpu-node-reaper/api/v1alpha1"
+)
+
+const (
+	StateActive      = "ACTIVE"
+	StateCompleting  = "COMPLETING"
+	StateReclaimable = "RECLAIMABLE"
+	StateReleased    = "RELEASED"
+
+	StateAnnotation = "reaper.harouna.dev/state"
+	StallTimeout    = 10 * time.Minute
 )
 
 type TrainingJobReconciler struct {
@@ -44,57 +56,114 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, fmt.Errorf("listing pods: %w", err)
 	}
 
-	log.Info("Found pods", "count", len(podList.Items))
-
-	// 3. Collect nodes running active pods
+	// 3. Classify pod state
+	var runningPods, succeededPods, failedPods int
 	nodeNames := map[string]bool{}
 	for _, pod := range podList.Items {
-		if pod.Status.Phase == corev1.PodRunning && pod.Spec.NodeName != "" {
-			nodeNames[pod.Spec.NodeName] = true
-		}
-	}
-
-	// 4. Annotate active nodes with do-not-disrupt
-	for nodeName := range nodeNames {
-		var node corev1.Node
-		if err := r.Get(ctx, client.ObjectKey{Name: nodeName}, &node); err != nil {
-			return ctrl.Result{}, fmt.Errorf("getting node %s: %w", nodeName, err)
-		}
-
-		if node.Annotations == nil {
-			node.Annotations = map[string]string{}
-		}
-
-		if node.Annotations["karpenter.sh/do-not-disrupt"] != "true" {
-			node.Annotations["karpenter.sh/do-not-disrupt"] = "true"
-			if err := r.Update(ctx, &node); err != nil {
-				return ctrl.Result{}, fmt.Errorf("annotating node %s: %w", nodeName, err)
+		switch pod.Status.Phase {
+		case corev1.PodRunning:
+			runningPods++
+			if pod.Spec.NodeName != "" {
+				nodeNames[pod.Spec.NodeName] = true
 			}
-			log.Info("Protected node", "node", nodeName)
+		case corev1.PodSucceeded:
+			succeededPods++
+		case corev1.PodFailed:
+			failedPods++
 		}
 	}
 
-	// 5. If no active pods, remove do-not-disrupt from all gpu nodes
-	if len(nodeNames) == 0 {
-		var nodeList corev1.NodeList
-		if err := r.List(ctx, &nodeList, client.MatchingLabels{
-			"gpu-node": "true",
-		}); err != nil {
-			return ctrl.Result{}, fmt.Errorf("listing nodes: %w", err)
+	log.Info("Pod summary",
+		"running", runningPods,
+		"succeeded", succeededPods,
+		"failed", failedPods,
+		"nodes", len(nodeNames),
+	)
+
+	// 4. List GPU nodes
+	var nodeList corev1.NodeList
+	if err := r.List(ctx, &nodeList, client.MatchingLabels{
+		"gpu-node": "true",
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("listing gpu nodes: %w", err)
+	}
+
+	// 5. Drive state machine for each GPU node
+	for _, node := range nodeList.Items {
+		node := node
+		currentState := node.Annotations[StateAnnotation]
+
+		if nodeNames[node.Name] {
+			// Node has active training pods — ensure ACTIVE
+			if err := r.transitionTo(ctx, &node, StateActive, log); err != nil {
+				return ctrl.Result{}, err
+			}
+			continue
 		}
 
-		for _, node := range nodeList.Items {
-			if node.Annotations["karpenter.sh/do-not-disrupt"] == "true" {
-				delete(node.Annotations, "karpenter.sh/do-not-disrupt")
+		// No active pods on this node
+		switch currentState {
+		case StateActive:
+			// Job just completed or stalled — move to COMPLETING
+			log.Info("Job completed or stalled, beginning reclamation", "node", node.Name)
+			if err := r.transitionTo(ctx, &node, StateCompleting, log); err != nil {
+				return ctrl.Result{}, err
+			}
+
+		case StateCompleting:
+			// Cordon the node
+			if !node.Spec.Unschedulable {
+				node.Spec.Unschedulable = true
 				if err := r.Update(ctx, &node); err != nil {
-					return ctrl.Result{}, fmt.Errorf("removing annotation from node %s: %w", node.Name, err)
+					return ctrl.Result{}, fmt.Errorf("cordoning node %s: %w", node.Name, err)
 				}
-				log.Info("Released node", "node", node.Name)
+				log.Info("Cordoned node", "node", node.Name)
 			}
+			if err := r.transitionTo(ctx, &node, StateReclaimable, log); err != nil {
+				return ctrl.Result{}, err
+			}
+
+		case StateReclaimable:
+			// Remove do-not-disrupt, release to Karpenter
+			if err := r.transitionTo(ctx, &node, StateReleased, log); err != nil {
+				return ctrl.Result{}, err
+			}
+
+		case StateReleased:
+			// Nothing to do — Karpenter takes it from here
+			log.Info("Node released to Karpenter", "node", node.Name)
 		}
 	}
 
-	return ctrl.Result{}, nil
+	// 6. Requeue to check for stalls
+	return ctrl.Result{RequeueAfter: StallTimeout}, nil
+}
+
+func (r *TrainingJobReconciler) transitionTo(ctx context.Context, node *corev1.Node, state string, log logr.Logger) error {
+	if node.Annotations == nil {
+		node.Annotations = map[string]string{}
+	}
+
+	if node.Annotations[StateAnnotation] == state {
+		return nil // already in this state, no-op
+	}
+
+	previous := node.Annotations[StateAnnotation]
+	node.Annotations[StateAnnotation] = state
+
+	switch state {
+	case StateActive:
+		node.Annotations["karpenter.sh/do-not-disrupt"] = "true"
+	case StateReleased:
+		delete(node.Annotations, "karpenter.sh/do-not-disrupt")
+	}
+
+	if err := r.Update(ctx, node); err != nil {
+		return fmt.Errorf("transitioning node %s to %s: %w", node.Name, state, err)
+	}
+
+	log.Info("Node state transition", "node", node.Name, "from", previous, "to", state)
+	return nil
 }
 
 func (r *TrainingJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
