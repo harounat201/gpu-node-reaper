@@ -1,0 +1,50 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - nodes
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - ""
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - training.harouna.dev
+  resources:
+  - trainingjobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - training.harouna.dev
+  resources:
+  - trainingjobs/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - training.harouna.dev
+  resources:
+  - trainingjobs/status
+  verbs:
+  - get
+  - patch
+  - update

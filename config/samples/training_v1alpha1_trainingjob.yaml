@@ -1,0 +1,9 @@
+apiVersion: training.harouna.dev/v1alpha1
+kind: TrainingJob
+metadata:
+  labels:
+    app.kubernetes.io/name: gpu-node-reaper
+    app.kubernetes.io/managed-by: kustomize
+  name: trainingjob-sample
+spec:
+  # TODO(user): Add fields here
