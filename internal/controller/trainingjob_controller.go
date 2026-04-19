@@ -7,6 +7,9 @@ import (
 
 	"github.com/go-logr/logr"
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -111,7 +114,7 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 
 		case StateCompleting:
-			// Cordon the node
+			// Cordon first
 			if !node.Spec.Unschedulable {
 				node.Spec.Unschedulable = true
 				if err := r.Update(ctx, &node); err != nil {
@@ -119,6 +122,51 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				}
 				log.Info("Cordoned node", "node", node.Name)
 			}
+
+			// Evict all non-DaemonSet pods
+			var podList corev1.PodList
+			if err := r.List(ctx, &podList, client.MatchingFields{
+				"spec.nodeName": node.Name,
+			}); err != nil {
+				return ctrl.Result{}, fmt.Errorf("listing pods on node %s: %w", node.Name, err)
+			}
+
+			allEvicted := true
+			for _, pod := range podList.Items {
+				pod := pod
+
+				// Skip DaemonSet pods
+				if isDaemonSetPod(&pod) {
+					continue
+				}
+
+				// Skip already terminating pods
+				if pod.DeletionTimestamp != nil {
+					allEvicted = false
+					continue
+				}
+
+				eviction := &policyv1.Eviction{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      pod.Name,
+						Namespace: pod.Namespace,
+					},
+				}
+				if err := r.Client.SubResource("eviction").Create(ctx, &pod, eviction); err != nil {
+					if !apierrors.IsNotFound(err) && !apierrors.IsTooManyRequests(err) {
+						return ctrl.Result{}, fmt.Errorf("evicting pod %s: %w", pod.Name, err)
+					}
+				}
+				log.Info("Evicted pod", "pod", pod.Name, "node", node.Name)
+				allEvicted = false
+			}
+
+			// Only advance to RECLAIMABLE when all pods are gone
+			if !allEvicted {
+				log.Info("Waiting for pods to finish evicting", "node", node.Name)
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+
 			if err := r.transitionTo(ctx, &node, StateReclaimable, log); err != nil {
 				return ctrl.Result{}, err
 			}
@@ -166,7 +214,28 @@ func (r *TrainingJobReconciler) transitionTo(ctx context.Context, node *corev1.N
 	return nil
 }
 
+func isDaemonSetPod(pod *corev1.Pod) bool {
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind == "DaemonSet" {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *TrainingJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	if err := mgr.GetFieldIndexer().IndexField(
+		context.Background(),
+		&corev1.Pod{},
+		"spec.nodeName",
+		func(obj client.Object) []string {
+			pod := obj.(*corev1.Pod)
+			return []string{pod.Spec.NodeName}
+		},
+	); err != nil {
+		return err
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&trainingv1alpha1.TrainingJob{}).
 		Watches(
