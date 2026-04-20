@@ -26,8 +26,10 @@ const (
 	StateReclaimable = "RECLAIMABLE"
 	StateReleased    = "RELEASED"
 
-	StateAnnotation = "reaper.harouna.dev/state"
-	StallTimeout    = 10 * time.Minute
+	StateAnnotation         = "reaper.harouna.dev/state"
+	StallTimeout            = 10 * time.Minute
+	UtilizationThreshold    = 0.3
+	ConsolidationAnnotation = "reaper.harouna.dev/consolidation-candidate"
 )
 
 type TrainingJobReconciler struct {
@@ -178,8 +180,10 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 
 		case StateReleased:
-			// Nothing to do — Karpenter takes it from here
 			log.Info("Node released to Karpenter", "node", node.Name)
+			if err := r.checkUtilization(ctx, &node, log); err != nil {
+				return ctrl.Result{}, err
+			}
 		}
 	}
 
@@ -221,6 +225,84 @@ func isDaemonSetPod(pod *corev1.Pod) bool {
 		}
 	}
 	return false
+}
+
+func (r *TrainingJobReconciler) checkUtilization(ctx context.Context, node *corev1.Node, log logr.Logger) error {
+	var podList corev1.PodList
+	if err := r.List(ctx, &podList, client.MatchingFields{
+		"spec.nodeName": node.Name,
+	}); err != nil {
+		return fmt.Errorf("listing pods for utilization: %w", err)
+	}
+
+	// Sum requested GPU across all non-DaemonSet pods
+	totalRequestedGPU := int64(0)
+	for _, pod := range podList.Items {
+		if isDaemonSetPod(&pod) {
+			continue
+		}
+		for _, container := range pod.Spec.Containers {
+			if gpu, ok := container.Resources.Requests["nvidia.com/gpu"]; ok {
+				totalRequestedGPU += gpu.Value()
+			}
+		}
+	}
+
+	// Get allocatable GPUs on this node
+	allocatableGPU := int64(0)
+	if gpu, ok := node.Status.Allocatable["nvidia.com/gpu"]; ok {
+		allocatableGPU = gpu.Value()
+	}
+
+	// In kind, no real GPUs exist — use CPU as proxy
+	if allocatableGPU == 0 {
+		allocatableGPU = node.Status.Allocatable.Cpu().MilliValue()
+		totalRequestedGPU = 0
+		for _, pod := range podList.Items {
+			if isDaemonSetPod(&pod) {
+				continue
+			}
+			for _, container := range pod.Spec.Containers {
+				totalRequestedGPU += container.Resources.Requests.Cpu().MilliValue()
+			}
+		}
+	}
+
+	if allocatableGPU == 0 {
+		return nil
+	}
+
+	utilization := float64(totalRequestedGPU) / float64(allocatableGPU)
+	log.Info("Node utilization", "node", node.Name,
+		"requested", totalRequestedGPU,
+		"allocatable", allocatableGPU,
+		"utilization", fmt.Sprintf("%.1f%%", utilization*100),
+	)
+
+	if node.Annotations == nil {
+		node.Annotations = map[string]string{}
+	}
+
+	if utilization < UtilizationThreshold {
+		if node.Annotations[ConsolidationAnnotation] != "true" {
+			node.Annotations[ConsolidationAnnotation] = "true"
+			if err := r.Update(ctx, node); err != nil {
+				return fmt.Errorf("marking consolidation candidate: %w", err)
+			}
+			log.Info("Marked node as consolidation candidate", "node", node.Name,
+				"utilization", fmt.Sprintf("%.1f%%", utilization*100))
+		}
+	} else {
+		if node.Annotations[ConsolidationAnnotation] == "true" {
+			delete(node.Annotations, ConsolidationAnnotation)
+			if err := r.Update(ctx, node); err != nil {
+				return fmt.Errorf("clearing consolidation candidate: %w", err)
+			}
+			log.Info("Cleared consolidation candidate", "node", node.Name)
+		}
+	}
+
+	return nil
 }
 
 func (r *TrainingJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
