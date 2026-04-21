@@ -206,8 +206,18 @@ func (r *TrainingJobReconciler) transitionTo(ctx context.Context, node *corev1.N
 	switch state {
 	case StateActive:
 		node.Annotations["karpenter.sh/do-not-disrupt"] = "true"
+		node.Annotations["reaper.harouna.dev/active-since"] = time.Now().UTC().Format(time.RFC3339)
+		nodesProtectedTotal.Inc()
+
 	case StateReleased:
 		delete(node.Annotations, "karpenter.sh/do-not-disrupt")
+		nodesReleasedTotal.Inc()
+		if activeSince, ok := node.Annotations["reaper.harouna.dev/active-since"]; ok {
+			if t, err := time.Parse(time.RFC3339, activeSince); err == nil {
+				reclamationDuration.Observe(time.Since(t).Seconds())
+			}
+			delete(node.Annotations, "reaper.harouna.dev/active-since")
+		}
 	}
 
 	if err := r.Update(ctx, node); err != nil {
@@ -300,6 +310,12 @@ func (r *TrainingJobReconciler) checkUtilization(ctx context.Context, node *core
 			}
 			log.Info("Cleared consolidation candidate", "node", node.Name)
 		}
+	}
+
+	if node.Annotations[ConsolidationAnnotation] == "true" {
+		consolidationCandidates.Inc()
+	} else {
+		consolidationCandidates.Dec()
 	}
 
 	return nil
