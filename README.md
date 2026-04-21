@@ -1,5 +1,5 @@
-# gpu-node-reaper
-// TODO(user): Add simple overview of use/purpose
+# gpu-node-reaper: Reaper
+Harness the power of kind (Kubernetes in Docker) to support distributed ML training workflows on AWS EKS (Elastic K8s Service). Reaper is a custom policy layer designed to 1) protect provisioned gang training nodes from deprovisionment by Karpenter on EKS and 2) support horizontal autoscaling in these workflows by automatically facilitating first-fit pod bin-packing and node consolidation. 
 
 ## Description
 // TODO(user): An in-depth paragraph about your project and overview of use
