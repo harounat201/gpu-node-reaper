@@ -1,135 +1,147 @@
 # gpu-node-reaper
-// TODO(user): Add simple overview of use/purpose
 
-## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A Kubernetes controller that manages GPU node lifecycle on Karpenter-managed EKS clusters.
 
-## Getting Started
+**The problem:** Karpenter is great at provisioning and terminating nodes, but it has no awareness of distributed training jobs. It can consolidate a node mid-training and kill your 8-hour PyTorch run. And after a job finishes, idle GPU nodes can sit unclaimed for minutes while Karpenter waits for its consolidation window.
 
-### Prerequisites
-- go version v1.24.6+
-- docker version 17.03+.
-- kubectl version v1.11.3+.
-- Access to a Kubernetes v1.11.3+ cluster.
+**What this does:** You declare a `TrainingJob` resource pointing at your training pods. The controller:
+1. Applies `karpenter.sh/do-not-disrupt` to GPU nodes running your pods — Karpenter will not touch them
+2. Detects when the job completes (or stalls), cordons the nodes, and drains remaining pods
+3. Removes the annotation so Karpenter can reclaim the nodes immediately
+4. Flags underutilized nodes as consolidation candidates
 
-### To Deploy on the cluster
-**Build and push your image to the location specified by `IMG`:**
+## Install
 
-```sh
-make docker-build docker-push IMG=<some-registry>/gpu-node-reaper:tag
+```bash
+kubectl apply -f https://github.com/harounat201/gpu-node-reaper/releases/latest/download/install.yaml
 ```
 
-**NOTE:** This image ought to be published in the personal registry you specified.
-And it is required to have access to pull the image from the working environment.
-Make sure you have the proper permission to the registry if the above commands don’t work.
+That's it. No Helm required. The CRD, RBAC, and controller Deployment are all in that file.
 
-**Install the CRDs into the cluster:**
+## Quick start
 
-```sh
+Label your GPU nodes so the controller can find them:
+
+```bash
+kubectl label node <your-gpu-node> gpu-node=true
+```
+
+Declare a TrainingJob that points at your training pods:
+
+```yaml
+apiVersion: training.harouna.dev/v1alpha1
+kind: TrainingJob
+metadata:
+  name: my-training-run
+  namespace: default
+spec:
+  podSelector:
+    matchLabels:
+      app: my-trainer
+      role: worker
+```
+
+Apply it before (or when) you launch your training pods:
+
+```bash
+kubectl apply -f trainingjob.yaml
+kubectl apply -f training-pods.yaml
+```
+
+Watch the lifecycle:
+
+```bash
+kubectl get trainingjob my-training-run -w
+# NAME               PHASE       NODES                    AGE
+# my-training-run    Running     ["gpu-node-1","gpu-node-2"]   2m
+
+kubectl get events --field-selector involvedObject.name=gpu-node-1
+# StateTransition: Transitioned from  to ACTIVE
+# StateTransition: Transitioned from ACTIVE to COMPLETING
+# NodeCordoned: Cordoned node for reclamation
+# StateTransition: Transitioned from COMPLETING to RECLAIMABLE
+# StateTransition: Transitioned from RECLAIMABLE to RELEASED
+```
+
+## How it works
+
+The controller watches for pods matching your `podSelector` on nodes labeled `gpu-node=true`. It drives each node through a state machine:
+
+```
+ACTIVE → COMPLETING → RECLAIMABLE → RELEASED
+```
+
+| State | What's happening | Karpenter annotation |
+|---|---|---|
+| `ACTIVE` | Training pods are running | `do-not-disrupt: true` |
+| `COMPLETING` | Pods finished — cordoning and draining | `do-not-disrupt: true` |
+| `RECLAIMABLE` | Node is empty and safe to reclaim | removed |
+| `RELEASED` | Handed back to Karpenter | removed |
+
+Gang failure detection: if all pods disappear simultaneously (eviction or node failure), the controller detects the stall and drives the node to `RELEASED` after `stallTimeout`.
+
+## TrainingJob spec
+
+```yaml
+spec:
+  # Required: selects the pods that belong to this job
+  podSelector:
+    matchLabels:
+      app: my-trainer
+
+  # How long to wait for pods to drain before force-evicting (default: 5m)
+  drainTimeout: 5m
+
+  # How long a node can sit with no pods before force-reclaim (default: 10m)
+  stallTimeout: 10m
+
+  # GPU utilization % below which a released node is flagged for consolidation (default: 30)
+  utilizationThreshold: 30
+```
+
+## Prerequisites
+
+- Kubernetes 1.28+
+- Karpenter installed (controller is a no-op without it, but works fine)
+- GPU nodes labeled `gpu-node=true`
+
+## Local development
+
+```bash
+# Start the Kind cluster (Docker must be running)
+kind create cluster --name reaper-dev
+kubectl label node reaper-dev-worker gpu-node=true
+kubectl label node reaper-dev-worker2 gpu-node=true
+
+# Install CRDs and run the controller locally
 make install
+make run
+
+# In another terminal — apply a sample job
+kubectl apply -f config/samples/training_v1alpha1_trainingjob.yaml
+
+# Simulate a training pod on a GPU node
+kubectl run worker-0 --image=busybox --labels="app=pytorch-resnet,role=worker" \
+  --overrides='{"spec":{"nodeName":"reaper-dev-worker"}}' -- sleep 3600
+
+# Watch node state transitions
+kubectl get nodes -o custom-columns=NAME:.metadata.name,STATE:.metadata.annotations.reaper\\.harouna\\.dev/state
+
+# Delete the pod to trigger reclamation
+kubectl delete pod worker-0
 ```
 
-**Deploy the Manager to the cluster with the image specified by `IMG`:**
+## Releasing
 
-```sh
-make deploy IMG=<some-registry>/gpu-node-reaper:tag
+Push a tag to trigger the release workflow:
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
 ```
 
-> **NOTE**: If you encounter RBAC errors, you may need to grant yourself cluster-admin
-privileges or be logged in as admin.
-
-**Create instances of your solution**
-You can apply the samples (examples) from the config/sample:
-
-```sh
-kubectl apply -k config/samples/
-```
-
->**NOTE**: Ensure that the samples has default values to test it out.
-
-### To Uninstall
-**Delete the instances (CRs) from the cluster:**
-
-```sh
-kubectl delete -k config/samples/
-```
-
-**Delete the APIs(CRDs) from the cluster:**
-
-```sh
-make uninstall
-```
-
-**UnDeploy the controller from the cluster:**
-
-```sh
-make undeploy
-```
-
-## Project Distribution
-
-Following the options to release and provide this solution to the users.
-
-### By providing a bundle with all YAML files
-
-1. Build the installer for the image built and published in the registry:
-
-```sh
-make build-installer IMG=<some-registry>/gpu-node-reaper:tag
-```
-
-**NOTE:** The makefile target mentioned above generates an 'install.yaml'
-file in the dist directory. This file contains all the resources built
-with Kustomize, which are necessary to install this project without its
-dependencies.
-
-2. Using the installer
-
-Users can just run 'kubectl apply -f <URL for YAML BUNDLE>' to install
-the project, i.e.:
-
-```sh
-kubectl apply -f https://raw.githubusercontent.com/<org>/gpu-node-reaper/<tag or branch>/dist/install.yaml
-```
-
-### By providing a Helm Chart
-
-1. Build the chart using the optional helm plugin
-
-```sh
-kubebuilder edit --plugins=helm/v2-alpha
-```
-
-2. See that a chart was generated under 'dist/chart', and users
-can obtain this solution from there.
-
-**NOTE:** If you change the project, you need to update the Helm Chart
-using the same command above to sync the latest changes. Furthermore,
-if you create webhooks, you need to use the above command with
-the '--force' flag and manually ensure that any custom configuration
-previously added to 'dist/chart/values.yaml' or 'dist/chart/manager/manager.yaml'
-is manually re-applied afterwards.
-
-## Contributing
-// TODO(user): Add detailed information on how you would like others to contribute to this project
-
-**NOTE:** Run `make help` for more information on all potential `make` targets
-
-More information can be found via the [Kubebuilder Documentation](https://book.kubebuilder.io/introduction.html)
+GitHub Actions builds a multi-arch image (`linux/amd64`, `linux/arm64`), pushes it to GHCR, and attaches `dist/install.yaml` to the GitHub release.
 
 ## License
 
-Copyright 2026.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-
+Apache 2.0
