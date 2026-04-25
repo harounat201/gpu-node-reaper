@@ -20,38 +20,58 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// EDIT THIS FILE!  THIS IS SCAFFOLDING FOR YOU TO OWN!
-// NOTE: json tags are required.  Any new fields you add must have json tags for the fields to be serialized.
+// TrainingJobPhase represents the lifecycle phase of a TrainingJob.
+type TrainingJobPhase string
 
-// TrainingJobSpec defines the desired state of TrainingJob
+const (
+	PhasePending    TrainingJobPhase = "Pending"
+	PhaseRunning    TrainingJobPhase = "Running"
+	PhaseCompleting TrainingJobPhase = "Completing"
+	PhaseCompleted  TrainingJobPhase = "Completed"
+)
+
+// TrainingJobSpec defines the desired policy for a distributed training job.
 type TrainingJobSpec struct {
-	// INSERT ADDITIONAL SPEC FIELDS - desired state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
-	// The following markers will use OpenAPI v3 schema to validate the value
-	// More info: https://book.kubebuilder.io/reference/markers/crd-validation.html
+	// PodSelector selects the pods that belong to this training job.
+	// The controller protects GPU nodes running matching pods from Karpenter disruption
+	// and reclaims those nodes once the job completes.
+	// +kubebuilder:validation:Required
+	PodSelector metav1.LabelSelector `json:"podSelector"`
 
-	// foo is an example field of TrainingJob. Edit trainingjob_types.go to remove/update
+	// DrainTimeout is the maximum time to wait for pods to terminate before
+	// force-evicting during node reclamation. Defaults to 5m.
 	// +optional
-	Foo *string `json:"foo,omitempty"`
+	DrainTimeout *metav1.Duration `json:"drainTimeout,omitempty"`
+
+	// StallTimeout is how long a node can remain in COMPLETING state with no
+	// active pods before being force-reclaimed. Defaults to 10m.
+	// +optional
+	StallTimeout *metav1.Duration `json:"stallTimeout,omitempty"`
+
+	// UtilizationThreshold is the GPU utilization percentage (0–100) below which
+	// a released node is flagged as a Karpenter consolidation candidate.
+	// +kubebuilder:default=30
+	// +kubebuilder:validation:Minimum=0
+	// +kubebuilder:validation:Maximum=100
+	// +optional
+	UtilizationThreshold *int32 `json:"utilizationThreshold,omitempty"`
 }
 
 // TrainingJobStatus defines the observed state of TrainingJob.
 type TrainingJobStatus struct {
-	// INSERT ADDITIONAL STATUS FIELD - define observed state of cluster
-	// Important: Run "make" to regenerate code after modifying this file
+	// Phase is the current lifecycle phase of the training job.
+	// +optional
+	Phase TrainingJobPhase `json:"phase,omitempty"`
 
-	// For Kubernetes API conventions, see:
-	// https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/api-conventions.md#typical-status-properties
+	// Nodes lists the GPU node names where this job's pods are running.
+	// +optional
+	Nodes []string `json:"nodes,omitempty"`
 
-	// conditions represent the current state of the TrainingJob resource.
-	// Each condition has a unique type and reflects the status of a specific aspect of the resource.
-	//
-	// Standard condition types include:
-	// - "Available": the resource is fully functional
-	// - "Progressing": the resource is being created or updated
-	// - "Degraded": the resource failed to reach or maintain its desired state
-	//
-	// The status of each condition is one of True, False, or Unknown.
+	// StartTime is when the job first transitioned to Running.
+	// +optional
+	StartTime *metav1.Time `json:"startTime,omitempty"`
+
+	// Conditions represent the current state of the TrainingJob resource.
 	// +listType=map
 	// +listMapKey=type
 	// +optional
@@ -60,27 +80,28 @@ type TrainingJobStatus struct {
 
 // +kubebuilder:object:root=true
 // +kubebuilder:subresource:status
+// +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=".status.phase"
+// +kubebuilder:printcolumn:name="Nodes",type=string,JSONPath=".status.nodes"
+// +kubebuilder:printcolumn:name="Age",type=date,JSONPath=".metadata.creationTimestamp"
 
-// TrainingJob is the Schema for the trainingjobs API
+// TrainingJob declares a distributed training workload whose GPU nodes should be
+// protected from Karpenter disruption during training and reclaimed promptly after.
 type TrainingJob struct {
 	metav1.TypeMeta `json:",inline"`
 
-	// metadata is a standard object metadata
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitzero"`
 
-	// spec defines the desired state of TrainingJob
 	// +optional
 	Spec TrainingJobSpec `json:"spec,omitempty"`
 
-	// status defines the observed state of TrainingJob
 	// +optional
 	Status TrainingJobStatus `json:"status,omitzero"`
 }
 
 // +kubebuilder:object:root=true
 
-// TrainingJobList contains a list of TrainingJob
+// TrainingJobList contains a list of TrainingJob.
 type TrainingJobList struct {
 	metav1.TypeMeta `json:",inline"`
 	metav1.ListMeta `json:"metadata,omitzero"`

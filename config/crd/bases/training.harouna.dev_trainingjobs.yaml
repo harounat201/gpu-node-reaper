@@ -14,10 +14,22 @@ spec:
     singular: trainingjob
   scope: Namespaced
   versions:
-  - name: v1alpha1
+  - additionalPrinterColumns:
+    - jsonPath: .status.phase
+      name: Phase
+      type: string
+    - jsonPath: .status.nodes
+      name: Nodes
+      type: string
+    - jsonPath: .metadata.creationTimestamp
+      name: Age
+      type: date
+    name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: TrainingJob is the Schema for the trainingjobs API
+        description: |-
+          TrainingJob declares a distributed training workload whose GPU nodes should be
+          protected from Karpenter disruption during training and reclaimed promptly after.
         properties:
           apiVersion:
             description: |-
@@ -37,27 +49,86 @@ spec:
           metadata:
             type: object
           spec:
-            description: spec defines the desired state of TrainingJob
+            description: TrainingJobSpec defines the desired policy for a distributed
+              training job.
             properties:
-              foo:
-                description: foo is an example field of TrainingJob. Edit trainingjob_types.go
-                  to remove/update
+              drainTimeout:
+                description: |-
+                  DrainTimeout is the maximum time to wait for pods to terminate before
+                  force-evicting during node reclamation. Defaults to 5m.
                 type: string
+              podSelector:
+                description: |-
+                  PodSelector selects the pods that belong to this training job.
+                  The controller protects GPU nodes running matching pods from Karpenter disruption
+                  and reclaims those nodes once the job completes.
+                properties:
+                  matchExpressions:
+                    description: matchExpressions is a list of label selector requirements.
+                      The requirements are ANDed.
+                    items:
+                      description: |-
+                        A label selector requirement is a selector that contains values, a key, and an operator that
+                        relates the key and values.
+                      properties:
+                        key:
+                          description: key is the label key that the selector applies
+                            to.
+                          type: string
+                        operator:
+                          description: |-
+                            operator represents a key's relationship to a set of values.
+                            Valid operators are In, NotIn, Exists and DoesNotExist.
+                          type: string
+                        values:
+                          description: |-
+                            values is an array of string values. If the operator is In or NotIn,
+                            the values array must be non-empty. If the operator is Exists or DoesNotExist,
+                            the values array must be empty. This array is replaced during a strategic
+                            merge patch.
+                          items:
+                            type: string
+                          type: array
+                          x-kubernetes-list-type: atomic
+                      required:
+                      - key
+                      - operator
+                      type: object
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    description: |-
+                      matchLabels is a map of {key,value} pairs. A single {key,value} in the matchLabels
+                      map is equivalent to an element of matchExpressions, whose key field is "key", the
+                      operator is "In", and the values array contains only "value". The requirements are ANDed.
+                    type: object
+                type: object
+                x-kubernetes-map-type: atomic
+              stallTimeout:
+                description: |-
+                  StallTimeout is how long a node can remain in COMPLETING state with no
+                  active pods before being force-reclaimed. Defaults to 10m.
+                type: string
+              utilizationThreshold:
+                default: 30
+                description: |-
+                  UtilizationThreshold is the GPU utilization percentage (0–100) below which
+                  a released node is flagged as a Karpenter consolidation candidate.
+                format: int32
+                maximum: 100
+                minimum: 0
+                type: integer
+            required:
+            - podSelector
             type: object
           status:
-            description: status defines the observed state of TrainingJob
+            description: TrainingJobStatus defines the observed state of TrainingJob.
             properties:
               conditions:
-                description: |-
-                  conditions represent the current state of the TrainingJob resource.
-                  Each condition has a unique type and reflects the status of a specific aspect of the resource.
-
-                  Standard condition types include:
-                  - "Available": the resource is fully functional
-                  - "Progressing": the resource is being created or updated
-                  - "Degraded": the resource failed to reach or maintain its desired state
-
-                  The status of each condition is one of True, False, or Unknown.
+                description: Conditions represent the current state of the TrainingJob
+                  resource.
                 items:
                   description: Condition contains details for one aspect of the current
                     state of this API Resource.
@@ -116,6 +187,20 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              nodes:
+                description: Nodes lists the GPU node names where this job's pods
+                  are running.
+                items:
+                  type: string
+                type: array
+              phase:
+                description: Phase is the current lifecycle phase of the training
+                  job.
+                type: string
+              startTime:
+                description: StartTime is when the job first transitioned to Running.
+                format: date-time
+                type: string
             type: object
         type: object
     served: true

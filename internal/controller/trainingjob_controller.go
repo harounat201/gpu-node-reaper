@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -10,6 +11,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -28,9 +30,10 @@ const (
 	StateReleased    = "RELEASED"
 
 	StateAnnotation         = "reaper.harouna.dev/state"
-	StallTimeout            = 10 * time.Minute
-	UtilizationThreshold    = 0.3
 	ConsolidationAnnotation = "reaper.harouna.dev/consolidation-candidate"
+
+	defaultStallTimeout          = 10 * time.Minute
+	defaultUtilizationThreshold  = 0.30
 )
 
 type TrainingJobReconciler struct {
@@ -56,15 +59,30 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
-	// 2. List all pods belonging to this job
+	// 2. Resolve per-job timeouts and thresholds
+	stallTimeout := defaultStallTimeout
+	if job.Spec.StallTimeout != nil && job.Spec.StallTimeout.Duration > 0 {
+		stallTimeout = job.Spec.StallTimeout.Duration
+	}
+	utilizationThreshold := defaultUtilizationThreshold
+	if job.Spec.UtilizationThreshold != nil {
+		utilizationThreshold = float64(*job.Spec.UtilizationThreshold) / 100.0
+	}
+
+	// 3. List pods matching the job's PodSelector
+	sel, err := metav1.LabelSelectorAsSelector(&job.Spec.PodSelector)
+	if err != nil {
+		return ctrl.Result{}, fmt.Errorf("invalid pod selector: %w", err)
+	}
 	var podList corev1.PodList
-	if err := r.List(ctx, &podList, client.MatchingLabels{
-		"training-job-id": job.Name,
-	}); err != nil {
+	if err := r.List(ctx, &podList,
+		client.InNamespace(req.Namespace),
+		client.MatchingLabelsSelector{Selector: sel},
+	); err != nil {
 		return ctrl.Result{}, fmt.Errorf("listing pods: %w", err)
 	}
 
-	// 3. Classify pod state
+	// 4. Classify pod state
 	var runningPods, succeededPods, failedPods int
 	nodeNames := map[string]bool{}
 	for _, pod := range podList.Items {
@@ -88,38 +106,32 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		"nodes", len(nodeNames),
 	)
 
-	// 4. List GPU nodes
+	// 5. List GPU nodes
 	var nodeList corev1.NodeList
-	if err := r.List(ctx, &nodeList, client.MatchingLabels{
-		"gpu-node": "true",
-	}); err != nil {
+	if err := r.List(ctx, &nodeList, client.MatchingLabels{"gpu-node": "true"}); err != nil {
 		return ctrl.Result{}, fmt.Errorf("listing gpu nodes: %w", err)
 	}
 
-	// 5. Drive state machine for each GPU node
+	// 6. Drive state machine for each GPU node
 	for _, node := range nodeList.Items {
 		node := node
 		currentState := node.Annotations[StateAnnotation]
 
 		if nodeNames[node.Name] {
-			// Node has active training pods — ensure ACTIVE
 			if err := r.transitionTo(ctx, &node, StateActive, log); err != nil {
 				return ctrl.Result{}, err
 			}
 			continue
 		}
 
-		// No active pods on this node
 		switch currentState {
 		case StateActive:
-			// Job just completed or stalled — move to COMPLETING
 			log.Info("Job completed or stalled, beginning reclamation", "node", node.Name)
 			if err := r.transitionTo(ctx, &node, StateCompleting, log); err != nil {
 				return ctrl.Result{}, err
 			}
 
 		case StateCompleting:
-			// Cordon first
 			if !node.Spec.Unschedulable {
 				node.Spec.Unschedulable = true
 				if err := r.Update(ctx, &node); err != nil {
@@ -132,29 +144,23 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				}
 			}
 
-			// Evict all non-DaemonSet pods
-			var podList corev1.PodList
-			if err := r.List(ctx, &podList, client.MatchingFields{
+			var nodePods corev1.PodList
+			if err := r.List(ctx, &nodePods, client.MatchingFields{
 				"spec.nodeName": node.Name,
 			}); err != nil {
 				return ctrl.Result{}, fmt.Errorf("listing pods on node %s: %w", node.Name, err)
 			}
 
 			allEvicted := true
-			for _, pod := range podList.Items {
+			for _, pod := range nodePods.Items {
 				pod := pod
-
-				// Skip DaemonSet pods
 				if isDaemonSetPod(&pod) {
 					continue
 				}
-
-				// Skip already terminating pods
 				if pod.DeletionTimestamp != nil {
 					allEvicted = false
 					continue
 				}
-
 				eviction := &policyv1.Eviction{
 					ObjectMeta: metav1.ObjectMeta{
 						Name:      pod.Name,
@@ -174,7 +180,6 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 				allEvicted = false
 			}
 
-			// Only advance to RECLAIMABLE when all pods are gone
 			if !allEvicted {
 				log.Info("Waiting for pods to finish evicting", "node", node.Name)
 				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
@@ -185,30 +190,71 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 			}
 
 		case StateReclaimable:
-			// Remove do-not-disrupt, release to Karpenter
 			if err := r.transitionTo(ctx, &node, StateReleased, log); err != nil {
 				return ctrl.Result{}, err
 			}
 
 		case StateReleased:
 			log.Info("Node released to Karpenter", "node", node.Name)
-			if err := r.checkUtilization(ctx, &node, log); err != nil {
+			if err := r.checkUtilization(ctx, &node, utilizationThreshold, log); err != nil {
 				return ctrl.Result{}, err
 			}
 		}
 	}
 
-	// 6. Requeue to check for stalls
-	return ctrl.Result{RequeueAfter: StallTimeout}, nil
+	// 7. Update job status
+	if err := r.updateStatus(ctx, &job, runningPods, nodeNames); err != nil {
+		return ctrl.Result{}, err
+	}
+
+	return ctrl.Result{RequeueAfter: stallTimeout}, nil
+}
+
+func (r *TrainingJobReconciler) updateStatus(
+	ctx context.Context,
+	job *trainingv1alpha1.TrainingJob,
+	runningPods int,
+	nodeNames map[string]bool,
+) error {
+	nodeSlice := make([]string, 0, len(nodeNames))
+	for n := range nodeNames {
+		nodeSlice = append(nodeSlice, n)
+	}
+	sort.Strings(nodeSlice)
+
+	var phase trainingv1alpha1.TrainingJobPhase
+	switch {
+	case runningPods > 0:
+		phase = trainingv1alpha1.PhaseRunning
+	case job.Status.Phase == trainingv1alpha1.PhaseRunning ||
+		job.Status.Phase == trainingv1alpha1.PhaseCompleting:
+		phase = trainingv1alpha1.PhaseCompleting
+	default:
+		phase = trainingv1alpha1.PhasePending
+	}
+
+	if job.Status.Phase == phase && stringSlicesEqual(job.Status.Nodes, nodeSlice) {
+		return nil
+	}
+
+	job.Status.Phase = phase
+	job.Status.Nodes = nodeSlice
+	if phase == trainingv1alpha1.PhaseRunning && job.Status.StartTime == nil {
+		now := metav1.Now()
+		job.Status.StartTime = &now
+	}
+	if err := r.Status().Update(ctx, job); err != nil {
+		return fmt.Errorf("updating job status: %w", err)
+	}
+	return nil
 }
 
 func (r *TrainingJobReconciler) transitionTo(ctx context.Context, node *corev1.Node, state string, log logr.Logger) error {
 	if node.Annotations == nil {
 		node.Annotations = map[string]string{}
 	}
-
 	if node.Annotations[StateAnnotation] == state {
-		return nil // already in this state, no-op
+		return nil
 	}
 
 	previous := node.Annotations[StateAnnotation]
@@ -219,7 +265,6 @@ func (r *TrainingJobReconciler) transitionTo(ctx context.Context, node *corev1.N
 		node.Annotations["karpenter.sh/do-not-disrupt"] = "true"
 		node.Annotations["reaper.harouna.dev/active-since"] = time.Now().UTC().Format(time.RFC3339)
 		nodesProtectedTotal.Inc()
-
 	case StateReleased:
 		delete(node.Annotations, "karpenter.sh/do-not-disrupt")
 		nodesReleasedTotal.Inc()
@@ -243,16 +288,12 @@ func (r *TrainingJobReconciler) transitionTo(ctx context.Context, node *corev1.N
 	return nil
 }
 
-func isDaemonSetPod(pod *corev1.Pod) bool {
-	for _, ref := range pod.OwnerReferences {
-		if ref.Kind == "DaemonSet" {
-			return true
-		}
-	}
-	return false
-}
-
-func (r *TrainingJobReconciler) checkUtilization(ctx context.Context, node *corev1.Node, log logr.Logger) error {
+func (r *TrainingJobReconciler) checkUtilization(
+	ctx context.Context,
+	node *corev1.Node,
+	threshold float64,
+	log logr.Logger,
+) error {
 	var podList corev1.PodList
 	if err := r.List(ctx, &podList, client.MatchingFields{
 		"spec.nodeName": node.Name,
@@ -260,7 +301,6 @@ func (r *TrainingJobReconciler) checkUtilization(ctx context.Context, node *core
 		return fmt.Errorf("listing pods for utilization: %w", err)
 	}
 
-	// Sum requested GPU across all non-DaemonSet pods
 	totalRequestedGPU := int64(0)
 	for _, pod := range podList.Items {
 		if isDaemonSetPod(&pod) {
@@ -273,13 +313,12 @@ func (r *TrainingJobReconciler) checkUtilization(ctx context.Context, node *core
 		}
 	}
 
-	// Get allocatable GPUs on this node
 	allocatableGPU := int64(0)
 	if gpu, ok := node.Status.Allocatable["nvidia.com/gpu"]; ok {
 		allocatableGPU = gpu.Value()
 	}
 
-	// In kind, no real GPUs exist — use CPU as proxy
+	// Kind dev clusters have no real GPUs — fall back to CPU as a proxy
 	if allocatableGPU == 0 {
 		allocatableGPU = node.Status.Allocatable.Cpu().MilliValue()
 		totalRequestedGPU = 0
@@ -308,7 +347,7 @@ func (r *TrainingJobReconciler) checkUtilization(ctx context.Context, node *core
 		node.Annotations = map[string]string{}
 	}
 
-	if utilization < UtilizationThreshold {
+	if utilization < threshold {
 		if node.Annotations[ConsolidationAnnotation] != "true" {
 			node.Annotations[ConsolidationAnnotation] = "true"
 			if err := r.Update(ctx, node); err != nil {
@@ -342,8 +381,7 @@ func (r *TrainingJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		&corev1.Pod{},
 		"spec.nodeName",
 		func(obj client.Object) []string {
-			pod := obj.(*corev1.Pod)
-			return []string{pod.Spec.NodeName}
+			return []string{obj.(*corev1.Pod).Spec.NodeName}
 		},
 	); err != nil {
 		return err
@@ -360,11 +398,46 @@ func (r *TrainingJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 }
 
 func (r *TrainingJobReconciler) podToTrainingJob(ctx context.Context, obj client.Object) []reconcile.Request {
-	jobID, ok := obj.GetLabels()["training-job-id"]
+	pod, ok := obj.(*corev1.Pod)
 	if !ok {
 		return nil
 	}
-	return []reconcile.Request{
-		{NamespacedName: client.ObjectKey{Name: jobID, Namespace: obj.GetNamespace()}},
+	var jobList trainingv1alpha1.TrainingJobList
+	if err := r.List(ctx, &jobList, client.InNamespace(pod.Namespace)); err != nil {
+		return nil
 	}
+	var requests []reconcile.Request
+	for _, job := range jobList.Items {
+		sel, err := metav1.LabelSelectorAsSelector(&job.Spec.PodSelector)
+		if err != nil {
+			continue
+		}
+		if sel.Matches(labels.Set(pod.Labels)) {
+			requests = append(requests, reconcile.Request{
+				NamespacedName: client.ObjectKey{Name: job.Name, Namespace: job.Namespace},
+			})
+		}
+	}
+	return requests
+}
+
+func isDaemonSetPod(pod *corev1.Pod) bool {
+	for _, ref := range pod.OwnerReferences {
+		if ref.Kind == "DaemonSet" {
+			return true
+		}
+	}
+	return false
+}
+
+func stringSlicesEqual(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
