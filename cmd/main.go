@@ -35,6 +35,7 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
+	apiserver "github.com/harounat201/gpu-node-reaper/api-server"
 	trainingv1alpha1 "github.com/harounat201/gpu-node-reaper/api/v1alpha1"
 	"github.com/harounat201/gpu-node-reaper/internal/controller"
 	// +kubebuilder:scaffold:imports
@@ -59,12 +60,14 @@ func main() {
 	var webhookCertPath, webhookCertName, webhookCertKey string
 	var enableLeaderElection bool
 	var probeAddr string
+	var apiAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
 	var tlsOpts []func(*tls.Config)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
+	flag.StringVar(&apiAddr, "api-bind-address", ":8082", "The address the HTTP API server binds to.")
 	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
 		"Enable leader election for controller manager. "+
 			"Enabling this will ensure there is only one active controller manager.")
@@ -181,10 +184,16 @@ func main() {
 	}
 
 	if err := (&controller.TrainingJobReconciler{
-		Client: mgr.GetClient(),
-		Scheme: mgr.GetScheme(),
+		Client:   mgr.GetClient(),
+		Scheme:   mgr.GetScheme(),
+		Recorder: mgr.GetEventRecorderFor("gpu-node-reaper"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "Failed to create controller", "controller", "TrainingJob")
+		os.Exit(1)
+	}
+
+	if err := mgr.Add(apiserver.New(mgr.GetClient(), apiAddr)); err != nil {
+		setupLog.Error(err, "Failed to add API server")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder

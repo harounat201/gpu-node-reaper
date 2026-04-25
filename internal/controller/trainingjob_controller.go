@@ -11,6 +11,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/tools/record"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -34,7 +35,8 @@ const (
 
 type TrainingJobReconciler struct {
 	client.Client
-	Scheme *runtime.Scheme
+	Scheme   *runtime.Scheme
+	Recorder record.EventRecorder
 }
 
 // +kubebuilder:rbac:groups=training.harouna.dev,resources=trainingjobs,verbs=get;list;watch;create;update;patch;delete
@@ -42,6 +44,7 @@ type TrainingJobReconciler struct {
 // +kubebuilder:rbac:groups=training.harouna.dev,resources=trainingjobs/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=nodes,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
 
 func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := logf.FromContext(ctx)
@@ -123,6 +126,10 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					return ctrl.Result{}, fmt.Errorf("cordoning node %s: %w", node.Name, err)
 				}
 				log.Info("Cordoned node", "node", node.Name)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(&node, corev1.EventTypeNormal, "NodeCordoned",
+						"Cordoned node for reclamation")
+				}
 			}
 
 			// Evict all non-DaemonSet pods
@@ -160,6 +167,10 @@ func (r *TrainingJobReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 					}
 				}
 				log.Info("Evicted pod", "pod", pod.Name, "node", node.Name)
+				if r.Recorder != nil {
+					r.Recorder.Eventf(&pod, corev1.EventTypeNormal, "PodEvicted",
+						"Pod evicted by gpu-node-reaper for node reclamation")
+				}
 				allEvicted = false
 			}
 
@@ -225,6 +236,10 @@ func (r *TrainingJobReconciler) transitionTo(ctx context.Context, node *corev1.N
 	}
 
 	log.Info("Node state transition", "node", node.Name, "from", previous, "to", state)
+	if r.Recorder != nil {
+		r.Recorder.Eventf(node, corev1.EventTypeNormal, "StateTransition",
+			"Transitioned from %s to %s", previous, state)
+	}
 	return nil
 }
 
