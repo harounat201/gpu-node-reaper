@@ -1,8 +1,8 @@
 # gpu-node-reaper: Reaper
 
-Harness the power of Kind (Kubernetes in Docker) to support distributed ML training workflows on AWS EKS. Reaper is a custom policy layer designed to 1) protect provisioned gang training nodes from disruption by Karpenter on EKS and 2) support horizontal autoscaling in these workflows by automatically facilitating first-fit pod bin-packing and node consolidation.
+Harness the power of Kind (Kubernetes in Docker) to support distributed ML training workflows on AWS EKS. Reaper is a custom policy layer demo designed to 1) protect provisioned gang training nodes from disruption by Karpenter on EKS and 2) support horizontal autoscaling in these workflows by automatically facilitating first-fit pod bin-packing and node consolidation.
 
-A Kubernetes controller that manages GPU node lifecycle on Karpenter-managed EKS clusters.
+In short: A Kubernetes controller that manages GPU node lifecycle on Karpenter-managed EKS clusters.
 
 **The problem:** Karpenter is great at provisioning and terminating nodes, but it has no awareness of distributed training jobs. It can consolidate a node mid-training and kill your 8-hour PyTorch run. And after a job finishes, idle GPU nodes can sit unclaimed for minutes while Karpenter waits for its consolidation window.
 
